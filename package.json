@@ -1,0 +1,39 @@
+{
+  "name": "tgz-box",
+  "version": "1.0.0",
+  "description": "通过 package.json 或 package-lock.json 下载依赖及其间接依赖的 tgz 包和 package.json",
+  "type": "module",
+  "bin": {
+    "tgz": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [
+    "tgz",
+    "npm",
+    "cli",
+    "download",
+    "package-lock",
+    "package.json"
+  ],
+  "author": "your_name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "commander": "^12.1.0",
+    "download": "^8.0.0",
+    "got": "^8.3.2",
+    "inquirer": "^9.0.0",
+    "p-limit": "^6.2.0"
+  },
+  "devDependencies": {
+    "@types/download": "^8.0.5",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.0.0"
+  }
+}

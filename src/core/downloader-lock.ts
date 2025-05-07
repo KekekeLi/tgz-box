@@ -1,23 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import {
-  downloadPackageWithVersion,
+  countAllDepsFromLock,
+  downloadAllFromLockDeps,
+  prettyLogProgress,
+  printDownloadSummary
 } from '../utils/downloaderUtils.js';
-
-function countAllDeps(deps: any, counted = new Set<string>()) {
-  let count = 0;
-  for (const name in deps) {
-    const dep = deps[name];
-    const key = `${name}@${dep.version}`;
-    if (counted.has(key)) continue;
-    counted.add(key);
-    count++;
-    if (dep.dependencies) {
-      count += countAllDeps(dep.dependencies, counted);
-    }
-  }
-  return count;
-}
 
 export async function downloadAllFromLock(registry?: string) {
   const lockPath = path.join(process.cwd(), 'package-lock.json');
@@ -26,44 +14,41 @@ export async function downloadAllFromLock(registry?: string) {
     return;
   }
   const lock = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+  if (!lock.dependencies) {
+    console.error('No dependencies found in package-lock.json');
+    return;
+  }
+
+  // 隐藏光标
+  process.stdout.write('\x1b[?25l');
+
+  // 统计依赖
+  let countedNum = 0;
+  const countedSet = new Set<string>();
+  countAllDepsFromLock(lock.dependencies, countedSet, (name, version, count) => {
+    countedNum = count;
+    process.stdout.write('\r\x1b[2K');
+    process.stdout.write(`已统计依赖数：${countedNum}，当前：${name}@${version}   `);
+  });
+  const total = countedSet.size;
+  process.stdout.write(`\n依赖总数统计完成，共需下载 ${total} 个依赖。\n`);
+
+  // 下载依赖
+  const counters = { finished: 0, failed: 0 };
+  const failedList: { name: string; version: string }[] = [];
   const downloaded = new Set<string>();
+  await downloadAllFromLockDeps(
+    lock.dependencies,
+    downloaded,
+    prettyLogProgress,
+    counters,
+    failedList,
+    total,
+    registry
+  );
 
-  // 1. 先统计所有唯一依赖的总数
-  let total = 0;
-  let countedSet = new Set<string>();
-  if (lock.dependencies) {
-    total = countAllDeps(lock.dependencies, countedSet);
-  }
-  const totalCount = { value: total, finished: 0 };
+  printDownloadSummary(total, counters.finished, counters.failed, failedList);
 
-  function logProgress(info: { current: number; total: number; pkgName: string; version: string; percent?: number }) {
-    if (info.percent !== undefined && info.percent !== 100) {
-      process.stdout.write(
-        `\r[${info.current}/${info.total}] 正在下载 ${info.pkgName}@${info.version}... ${info.percent}%   `
-      );
-    } else if (info.percent === 100) {
-      process.stdout.write(
-        `\r[${info.current}/${info.total}] 完成下载 ${info.pkgName}@${info.version} ✔           \n`
-      );
-    }
-  }
-
-  async function walkDeps(deps: any) {
-    for (const name in deps) {
-      const dep = deps[name];
-      const key = `${name}@${dep.version}`;
-      if (downloaded.has(key)) continue; // 防止重复下载
-      if (dep.version) {
-        await downloadPackageWithVersion(name, dep.version, downloaded, logProgress, totalCount, registry);
-      }
-      if (dep.dependencies) {
-        await walkDeps(dep.dependencies);
-      }
-    }
-  }
-
-  if (lock.dependencies) {
-    await walkDeps(lock.dependencies);
-    console.log(`\n全部依赖下载完成！共下载 ${totalCount.finished}/${totalCount.value} 个依赖。`);
-  }
+  // 恢复光标
+  process.stdout.write('\x1b[?25h');
 }

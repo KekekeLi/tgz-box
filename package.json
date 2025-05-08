@@ -25,11 +25,15 @@
     "axios": "^1.6.0",
     "commander": "^12.1.0",
     "download": "^8.0.0",
+    "fs-extra": "^11.3.0",
     "got": "^8.3.2",
     "inquirer": "^9.0.0",
+    "node-cmd": "^5.0.0",
     "p-limit": "^6.2.0"
   },
   "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node-cmd": "^5.0.0",
     "@types/download": "^8.0.5",
     "@types/inquirer": "^9.0.7",
     "@types/node": "^20.0.0",

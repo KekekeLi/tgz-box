@@ -1,5 +1,5 @@
 import axios from 'axios';
-import fs from 'fs';
+import fs from 'fs-extra';
 import path from 'path';
 import got from 'got';
 import stream from 'stream';
@@ -159,50 +159,141 @@ export async function countAllDepsFromPackage(
 export function countAllDepsFromLock(deps: any, counted = new Set<string>(), onProgress?: (name: string, version: string, count: number) => void) {
   for (const name in deps) {
     const dep = deps[name];
-    const key = `${name}@${dep.version}`;
+    // 添加版本范围处理逻辑
+    const version = dep.version || (dep.dependencies ? '' : 'unknown');
+    const key = `${name}@${version}`;
+    
     if (counted.has(key)) continue;
     counted.add(key);
-    if (onProgress) onProgress(name, dep.version, counted.size);
+    
+    // 添加进度回调
+    if (onProgress) onProgress(name, version, counted.size);
+    
+    // 优化嵌套依赖处理
     if (dep.dependencies) {
       countAllDepsFromLock(dep.dependencies, counted, onProgress);
+    }
+    
+    // 处理可选依赖
+    if (dep.optional) {
+      counted.delete(key);
     }
   }
 }
 
 // 递归下载（package-lock.json场景）
-export async function downloadAllFromLockDeps(
-  deps: any,
-  downloaded: Set<string>,
-  progress: ProgressCallback,
-  counters: { finished: number; failed: number },
-  failedList: { name: string; version: string }[],
-  total: number,
-  registry?: string
-) {
-  for (const name in deps) {
-    const dep = deps[name];
-    const key = `${name}@${dep.version}`;
-    if (downloaded.has(key)) continue;
-    if (dep.version) {
-      try {
-        await downloadPackageWithVersion(
-          name,
-          dep.version,
-          downloaded,
-          (info) => progress({ ...info, total }),
-          counters,
-          registry
-        );
-      } catch (err) {
-        progress({ pkgName: name, version: dep.version, failed: true, current: counters.finished + counters.failed + 1, total });
-        counters.failed++;
-        failedList.push({ name, version: dep.version });
-      }
-    }
-    if (dep.dependencies) {
-      await downloadAllFromLockDeps(dep.dependencies, downloaded, progress, counters, failedList, total, registry);
+// 新增并发控制类
+export class DownloadQueue {
+  private queue: Promise<void>[] = [];
+  private concurrency: number;
+
+  constructor(concurrency = 5) {
+    this.concurrency = concurrency;
+  }
+
+  async add(task: () => Promise<void>) {
+    const promise = task().finally(() => {
+      this.queue.splice(this.queue.indexOf(promise), 1);
+    });
+    this.queue.push(promise);
+    if (this.queue.length >= this.concurrency) {
+      await Promise.race(this.queue);
     }
   }
+
+  async done() {
+    await Promise.all(this.queue);
+  }
+}
+
+// 修改下载函数
+/**
+ * 直接根据 parseLock 得到的 packages 数组批量下载
+ * @param packages PackageItem[]
+ * @param progress 进度回调
+ * @param registry 源
+ */
+export async function downloadAllFromLockDeps(
+  packages: { name: string; resolved: string; path: string; v: string }[],
+  progress: ProgressCallback,
+  registry?: string
+) {
+  const concurrency = 5;
+  let active = 0;
+  let index = 0;
+  let finished = 0;
+  let failed = 0;
+  const total = packages.length;
+  const failedList: { name: string; version: string }[] = [];
+  const queue: Promise<void>[] = [];
+
+  function downloadOne(pkg: { name: string; resolved: string; path: string; v: string }) {
+    return new Promise<void>(async (resolve) => {
+      try {
+        // 下载 tgz 包
+        const saveDir = path.join(process.cwd(), 'tgz', pkg.path);
+        await downloadWithProgress(
+          pkg.resolved,
+          saveDir,
+          undefined,
+          (percent) => {
+            progress({
+              current: finished + failed + 1,
+              total,
+              pkgName: pkg.name,
+              version: pkg.v,
+              percent
+            });
+          }
+        );
+        // 获取 package.json 信息
+        try {
+          const metaUrl = pkg.resolved.split('/-/')[0];
+          const res = await axios.get(metaUrl);
+          fs.writeFileSync(path.join(saveDir, 'package.json'), JSON.stringify(res.data, null, 2));
+        } catch (e) {
+          // package.json 获取失败不影响主流程
+        }
+        finished++;
+        progress({
+          current: finished + failed,
+          total,
+          pkgName: pkg.name,
+          version: pkg.v,
+          percent: 100
+        });
+      } catch (err) {
+        failed++;
+        failedList.push({ name: pkg.name, version: pkg.v });
+        progress({
+          current: finished + failed,
+          total,
+          pkgName: pkg.name,
+          version: pkg.v,
+          failed: true
+        });
+      }
+      resolve();
+    });
+  }
+
+  return new Promise<{ name: string; version: string }[]>(resolve => {
+    function next() {
+      while (active < concurrency && index < total) {
+        const pkg = packages[index++];
+        active++;
+        downloadOne(pkg).then(() => {
+          active--;
+          if (finished + failed < total) {
+            next();
+          } else if (active === 0) {
+            resolve(failedList);
+          }
+        });
+      }
+    }
+    next();
+  });
 }
 
 export function getPackageMetaUrl(pkgName: string, version?: string, registry?: string) {
@@ -243,30 +334,94 @@ export function prettyLogProgress(info: { current: number; total: number; pkgNam
   }
 }
 
-export function printDownloadSummary(total: number, success: number, failed: number, failedList: { name: string; version: string }[]) {
-  const colWidth = 10;
-  const sep = '│';
-  const line = `├${'─'.repeat(colWidth)}┼${'─'.repeat(colWidth)}┼${'─'.repeat(colWidth)}┤`;
-  const top = `┌${'─'.repeat(colWidth)}┬${'─'.repeat(colWidth)}┬${'─'.repeat(colWidth)}┐`;
-  const bottom = `└${'─'.repeat(colWidth)}┴${'─'.repeat(colWidth)}┴${'─'.repeat(colWidth)}┘`;
-
-  console.log('\n\x1b[1m下载统计表\x1b[0m');
-  console.log(top);
-  console.log(`${sep}${'总数'.padEnd(colWidth)}${sep}${'成功'.padEnd(colWidth)}${sep}${'失败'.padEnd(colWidth)}${sep}`);
-  console.log(line);
-  console.log(`${sep}${String(total).padEnd(colWidth)}${sep}${String(success).padEnd(colWidth)}${sep}${String(failed).padEnd(colWidth)}${sep}`);
-  console.log(bottom);
-
-  if (failedList.length > 0) {
-    console.log('\n\x1b[31m下载失败依赖列表：\x1b[0m');
-    console.log('┌───────────────────────────────┬───────────────┐');
-    console.log('│ 依赖名                        │ 版本          │');
-    console.log('├───────────────────────────────┼───────────────┤');
-    for (const item of failedList) {
-      const namePad = item.name.padEnd(30, ' ');
-      const verPad = (item.version || '').padEnd(13, ' ');
-      console.log(`│ ${namePad} │ ${verPad} │`);
-    }
-    console.log('└───────────────────────────────┴───────────────┘');
+/**
+ * 下载完成后输出总结信息
+ */
+export function printDownloadSummary(total: number, finished: number, failed: number, failedList: { name: string; version: string }[]) {
+  process.stdout.write('\n');
+  process.stdout.write(`\x1b[32m[完成]\x1b[0m 共需下载 ${total} 个依赖，成功：${finished}，失败：${failed}\n`);
+  if (failed > 0 && failedList.length > 0) {
+    process.stdout.write('\x1b[31m[失败依赖列表]\x1b[0m\n');
+    failedList.forEach(item => {
+      process.stdout.write(`  - ${item.name}@${item.version}\n`);
+    });
   }
+  process.stdout.write('\n');
+}
+
+
+export class ProgressTracker {
+  private total: number;
+  private finished = 0;
+  private startTime = Date.now();
+
+  constructor(total: number) {
+    this.total = total;
+  }
+
+  increment() {
+    this.finished++;
+    this.updateProgress();
+  }
+
+  private updateProgress() {
+    const elapsed = (Date.now() - this.startTime) / 1000;
+    const remaining = this.total > 0 ? 
+      (elapsed / this.finished) * (this.total - this.finished) : 0;
+    
+    process.stdout.write(
+      `\r\x1b[36m[进度]\x1b[0m ${this.finished}/${this.total} ` +
+      `已用: ${elapsed.toFixed(1)}s 剩余: ${remaining.toFixed(1)}s`
+    );
+  }
+}
+
+export function readLock (path: string): Promise<LockData> {
+  return new Promise((resolve) => {
+    try {
+      const context = fs.readJSONSync(path)
+      resolve(context)
+    } catch {
+      process.stdout.write(`\x1b[31m[错误]\x1b[0m  ${path} 读取失败\n`)
+      process.exit(0)
+    }
+  })
+}
+
+export function parseLock(lockData: LockData): PackageItem[] {
+  const packages: PackageItem[] = []
+
+  if (lockData.packages) {
+    for (const key in lockData.packages) {
+      const path = key.split('node_modules/').pop() || '';
+      if (path) {
+        const item = lockData.packages[key]
+        // 修复resolved字段处理逻辑
+        const cleanResolved = item.resolved.replace(/`/g, '').trim() // 移除反引号和空格
+        packages.push({
+          name: path.split('/').pop() || path,
+          resolved: cleanResolved,
+          path: path,
+          v: item.version
+        })
+      }
+    }
+  } else if (lockData.dependencies) {
+    const loopDependencies = (dependenciesData: any) => {
+      const dependencies = dependenciesData.dependencies || {};
+      Object.keys(dependencies).forEach(function (key) {
+        if (key) {
+          packages.push({
+            name: key,
+            resolved: dependencies[key].resolved.replace(/`/g, '').trim(), // 修复此处
+            path: key,
+            v: dependencies[key].version
+          })
+          loopDependencies(dependencies[key])
+        }
+      })
+    }
+    loopDependencies(lockData)
+  }
+  return packages
 }

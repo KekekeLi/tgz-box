@@ -5,3 +5,15 @@ type ProgressCallback = (info: {
     version: string;
     percent?: number;
   }) => void;
+
+interface LockData {
+    packages: Record<string, any>,
+    dependencies: Record<string, any>
+  }
+
+interface PackageItem {
+    name: string,
+    resolved: string,
+    path: string,
+    v: string
+  }

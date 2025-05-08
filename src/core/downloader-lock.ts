@@ -39,11 +39,7 @@ export async function downloadAllFromLock(registry?: string) {
   const downloaded = new Set<string>();
   await downloadAllFromLockDeps(
     lock.dependencies,
-    downloaded,
-    prettyLogProgress,
-    counters,
-    failedList,
-    total,
+    (info) => prettyLogProgress({ ...info, total }),
     registry
   );
 

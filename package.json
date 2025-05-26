@@ -1,0 +1,44 @@
+{
+  "name": "tgz-box",
+  "version": "1.0.0",
+  "description": "A tool for downloading npm dependencies as tgz files for offline environments",
+  "main": "dist/index.js",
+  "bin": {
+    "tgz-box": "dist/index.js",
+    "tgz": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "dev:install": "ts-node src/index.ts install",
+    "dev:package": "ts-node src/index.ts install -p",
+    "dev:name": "ts-node src/index.ts install vue@3.4.1"
+  },
+  "keywords": [
+    "tgz",
+    "npm",
+    "dependencies",
+    "offline",
+    "download"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chalk": "^4.1.2",
+    "commander": "^12.1.0",
+    "download": "^8.0.0",
+    "fs-extra": "^11.2.0",
+    "inquirer": "^8.2.6",
+    "node-cmd": "^5.0.0",
+    "ora": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/download": "^8.0.5",
+    "@types/fs-extra": "^11.0.4",
+    "@types/inquirer": "^8.2.10",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}

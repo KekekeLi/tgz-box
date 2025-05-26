@@ -1,0 +1,27 @@
+# 源码和配置
+src/
+tsconfig.json
+*.log
+*.md
+
+# 测试相关
+__tests__/
+coverage/
+
+# 依赖和缓存
+node_modules/
+.nyc_output/
+
+# 其他常见忽略项
+.DS_Store
+.idea/
+.vscode/
+.git/
+.gitignore
+.eslintrc
+.eslintignore
+
+# 构建产物（如有）
+dist/
+
+# 你可以根据实际情况增减

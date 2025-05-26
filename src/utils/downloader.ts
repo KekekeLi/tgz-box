@@ -12,6 +12,7 @@ export class PackageDownloader {
   private activeDownloads = 0;
   private progress: DownloadProgress;
   private onProgress?: (progress: DownloadProgress) => void;
+  private maxRetries: number = 3;
 
   constructor(concurrency = 10) {
     this.concurrency = concurrency;
@@ -39,7 +40,7 @@ export class PackageDownloader {
     const promises: Promise<void>[] = [];
 
     for (const pkg of packages) {
-      const promise = this.downloadSinglePackage(pkg)
+      const promise = this.downloadWithRetry(pkg)
         .then(() => {
           this.progress.completed++;
           this.updateProgress();
@@ -64,6 +65,20 @@ export class PackageDownloader {
     return failedPackages;
   }
 
+  private async downloadWithRetry(pkg: PackageItem, retryCount = 0): Promise<void> {
+    try {
+      await this.downloadSinglePackage(pkg);
+    } catch (error) {
+      if (retryCount < this.maxRetries) {
+        // 等待一段时间后重试
+        await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+        return this.downloadWithRetry(pkg, retryCount + 1);
+      } else {
+        throw error;
+      }
+    }
+  }
+
   private async downloadSinglePackage(pkg: PackageItem): Promise<void> {
     this.progress.current = pkg.name;
     this.updateProgress();
@@ -75,17 +90,41 @@ export class PackageDownloader {
       // 下载tgz文件
       await download(pkg.resolved, packageDir);
       
+      // 检查是否已存在package.json，如果存在且有效则跳过
+      const packageJsonPath = path.join(packageDir, 'package.json');
+      if (await fs.pathExists(packageJsonPath)) {
+        try {
+          const existingContent = await fs.readJSON(packageJsonPath);
+          if (existingContent && existingContent.name) {
+            return; // package.json已存在且有效
+          }
+        } catch {
+          // 文件损坏，继续重新下载
+        }
+      }
+      
       // 获取并保存package.json
       const packageInfoUrl = pkg.resolved.split('/-/')[0];
-      const response = await axios.get(packageInfoUrl);
+      const response = await axios.get(packageInfoUrl, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'tgz-box'
+        }
+      });
       
       await fs.writeJSON(
-        path.join(packageDir, 'package.json'),
+        packageJsonPath,
         response.data,
         { spaces: 2 }
       );
     } catch (error) {
-      throw new Error(`下载失败: ${pkg.name}@${pkg.version}`);
+      // 清理可能的部分下载文件
+      try {
+        await fs.remove(packageDir);
+      } catch {
+        // 忽略清理错误
+      }
+      throw new Error(`下载失败: ${pkg.name}@${pkg.version} - ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

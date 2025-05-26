@@ -1,6 +1,5 @@
 import { LockData, PackageItem } from '../types';
 import ora from 'ora';
-import chalk from 'chalk';
 
 export function parseLockFile(lockData: LockData, showProgress = true): PackageItem[] {
   const packages: PackageItem[] = [];

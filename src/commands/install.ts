@@ -78,12 +78,12 @@ async function determineLockFile(options: InstallOptions, packageName?: string):
 
   // 优先级处理
   if (hasPackageLock && !options.forcePackage) {
-    console.log(chalk.blue('解析 package-lock.json'));
+    console.log(chalk.blue('正在解析 package-lock.json...'));
     return PACKAGE_LOCK_PATH;
   }
   
   if (hasPackageJson && (options.package || options.forcePackage || !hasPackageLock)) {
-    console.log(chalk.blue('解析 package.json'));
+    console.log(chalk.blue('正在解析 package.json...'));
     return await generateLockFileFromPackage(PACKAGE_JSON_PATH);
   }
 
@@ -156,12 +156,12 @@ async function performAutoCheck() {
     
     // 如果发现版本不匹配问题，自动修复
     if (summary.versionMismatchPackages.length > 0) {
-      console.log(chalk.blue('正在自动修复...'));
+      console.log(chalk.blue('正在自动修复并重新检查依赖版本...'));
       
       // 自动修复版本不匹配
       const fixSummary = await checkTgzFiles(packagesDir, true);
       
-      // 只在这里打印最终检查结果，避免重复
+      // 打印最终检查结果
       if (fixSummary.fixedPackages.length > 0) {
         console.log(chalk.green(`已自动修复 ${fixSummary.fixedPackages.length} 个包的版本不匹配问题`));
       }

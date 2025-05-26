@@ -21,7 +21,7 @@
     "offline",
     "download"
   ],
-  "author": "Your Name",
+  "author": "like",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.0",

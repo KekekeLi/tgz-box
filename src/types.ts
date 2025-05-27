@@ -3,6 +3,7 @@ export interface PackageItem {
   resolved: string;
   path: string;
   version: string;
+  error?: string;
 }
 
 export interface LockData {

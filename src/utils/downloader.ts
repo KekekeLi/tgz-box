@@ -45,9 +45,11 @@ export class PackageDownloader {
           this.progress.completed++;
           this.updateProgress();
         })
-        .catch(() => {
+        .catch((error) => {
           this.progress.failed++;
-          failedPackages.push(pkg);
+          // 保存失败信息
+          const failedPkg = { ...pkg, error: error.message };
+          failedPackages.push(failedPkg);
           this.updateProgress();
         });
       
@@ -70,6 +72,10 @@ export class PackageDownloader {
       await this.downloadSinglePackage(pkg);
     } catch (error) {
       if (retryCount < this.maxRetries) {
+        // 更新进度显示重试信息
+        this.progress.current = `重试 ${retryCount + 1}/${this.maxRetries}: ${pkg.name}`;
+        this.updateProgress();
+        
         // 等待一段时间后重试
         await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
         return this.downloadWithRetry(pkg, retryCount + 1);

@@ -134,8 +134,11 @@ async function downloadPackages(packages: PackageItem[]) {
       
       console.log(chalk.red('失败的包:'));
       failedPackages.forEach(pkg => {
-        console.log(chalk.red(`  - ${pkg.path}@${pkg.version}`));
+        console.log(chalk.red(`  - ${pkg.path}@${pkg.version}${pkg.error ? ` (${pkg.error})` : ''}`));
       });
+      
+      // 询问用户是否重试失败的包
+      await handleFailedPackagesRetry(failedPackages);
     }
     
     console.log(chalk.blue(`文件保存位置: ./packages/`));
@@ -144,6 +147,74 @@ async function downloadPackages(packages: PackageItem[]) {
     currentSpinner.fail('下载过程中发生错误');
     throw error;
   }
+}
+
+// 处理失败包的重试逻辑
+async function handleFailedPackagesRetry(failedPackages: PackageItem[]) {
+  const { shouldRetry } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'shouldRetry',
+      message: `是否重新下载失败的 ${failedPackages.length} 个包？`,
+      default: true
+    }
+  ]);
+
+  if (!shouldRetry) {
+    console.log(chalk.yellow('跳过重试，可以稍后使用相同命令重新下载'));
+    return;
+  }
+
+  // 提供重试选项
+  const { retryOption } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'retryOption',
+      message: '选择重试方式:',
+      choices: [
+        { name: '重试所有失败的包', value: 'all' },
+        { name: '选择特定的包进行重试', value: 'select' },
+        { name: '取消重试', value: 'cancel' }
+      ]
+    }
+  ]);
+
+  if (retryOption === 'cancel') {
+    return;
+  }
+
+  let packagesToRetry = failedPackages;
+
+  if (retryOption === 'select') {
+    const { selectedPackages } = await inquirer.prompt([
+      {
+        type: 'checkbox',
+        name: 'selectedPackages',
+        message: '选择要重试的包:',
+        choices: failedPackages.map(pkg => ({
+          name: `${pkg.path}@${pkg.version}`,
+          value: pkg,
+          checked: true
+        }))
+      }
+    ]);
+    packagesToRetry = selectedPackages;
+  }
+
+  if (packagesToRetry.length === 0) {
+    console.log(chalk.yellow('没有选择要重试的包'));
+    return;
+  }
+
+  console.log(chalk.blue(`\n开始重试下载 ${packagesToRetry.length} 个包...`));
+  
+  // 清除错误信息，重新下载
+  const cleanPackages = packagesToRetry.map(pkg => {
+    const { error, ...cleanPkg } = pkg;
+    return cleanPkg;
+  });
+  
+  await downloadPackages(cleanPackages);
 }
 
 // 修改performAutoCheck函数

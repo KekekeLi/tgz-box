@@ -56,11 +56,7 @@ export async function check(options: CheckOptions = {}): Promise<void> {
             console.log(chalk.yellow(`⚠️  ${result.message}`));
             break;
           case 1:
-            if (result.message.includes('Edit:')) {
-              console.log(chalk.green(`✅ ${result.message}`));
-            } else {
-              console.log(chalk.green('✅ 包检查通过'));
-            }
+            console.log(chalk.green(`✅ ${result.message || '包检查通过'}`));
             break;
         }
       } else {
@@ -71,21 +67,21 @@ export async function check(options: CheckOptions = {}): Promise<void> {
       const summary = await checkTgzFiles(targetDirectory, options.fix);
       printCheckSummary(summary);
       
-      // 如果有问题且未启用自动修复，询问是否要修复
+      // 如果有版本不匹配且未启用自动下载，询问是否要下载
       if (!options.fix && summary.versionMismatchPackages.length > 0) {
-        const { shouldFix } = await inquirer.prompt([
+        const { shouldDownload } = await inquirer.prompt([
           {
             type: 'confirm',
-            name: 'shouldFix',
-            message: `发现 ${summary.versionMismatchPackages.length} 个版本不匹配的包，是否要自动修复？`,
+            name: 'shouldDownload',
+            message: `发现 ${summary.versionMismatchPackages.length} 个版本不匹配的依赖，是否要下载最新版本？`,
             default: false
           }
         ]);
         
-        if (shouldFix) {
-          console.log(chalk.blue('\n🔧 开始修复版本不匹配的包...'));
-          const fixSummary = await checkTgzFiles(targetDirectory, true);
-          printCheckSummary(fixSummary);
+        if (shouldDownload) {
+          console.log(chalk.blue('\n🔄 开始下载最新版本依赖...'));
+          const downloadSummary = await checkTgzFiles(targetDirectory, true);
+          printCheckSummary(downloadSummary);
         }
       }
     }

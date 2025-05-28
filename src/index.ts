@@ -3,10 +3,15 @@ import { Command } from 'commander';
 import fs from 'fs-extra';
 import path from 'path';
 import { install } from './commands/install';
-import { clearCache } from './commands/clearCache';
+import { clearCache } from './npm/cache';
 import { setupCheckCommand } from './commands/check';
+import { setupSignalHandlers } from './npm/npmUtils';
 
 const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'));
+
+
+// 设置信号处理
+setupSignalHandlers();
 
 const program = new Command();
 

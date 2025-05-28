@@ -2,45 +2,86 @@ import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
+import axios from 'axios';
+import { PackageDownloader } from './downloader';
+import { PackageItem } from '../types';
+import { TEMP_DIR } from './constants';
+import { ensureDirectoryExists } from './fileUtils';
 
 interface CheckResult {
   code: number; // -1: error, 0: warning, 1: success
   message: string;
 }
 
+interface PackageIntegrity {
+  packageName: string;
+  packagePath: string;
+  hasPackageJson: boolean;
+  hasTgzFile: boolean;
+  missingFiles: string[];
+}
+
+interface VersionMismatchInfo {
+  packageName: string;
+  packagePath: string;
+  currentVersion: string;
+  expectedVersion: string;
+  downloadUrl?: string;
+}
+
 interface CheckSummary {
   totalPackages: number;
-  missingTgzPackages: string[];
-  versionMismatchPackages: string[];
-  fixedPackages: string[];
+  incompletePackages: PackageIntegrity[];
+  versionMismatchPackages: VersionMismatchInfo[];
+  downloadedVersions: string[];
   errors: string[];
 }
 
 /**
- * 检查指定目录中的npm包是否包含.tgz文件
+ * 检查指定目录中的npm包完整性和版本匹配
  * @param directory 要检查的目录路径（通常是packages目录）
- * @param autoFix 是否自动修复package.json中的版本号
+ * @param downloadMissingVersions 是否下载缺失的版本
  * @returns 检查结果摘要
  */
-export async function checkTgzFiles(directory: string, autoFix = false): Promise<CheckSummary> {
-  const spinner = ora('正在检查tgz文件...');
+export async function checkTgzFiles(directory: string, downloadMissingVersions = false): Promise<CheckSummary> {
+  const spinner = ora('正在检查依赖完整性...');
   spinner.start();
   
   const summary: CheckSummary = {
     totalPackages: 0,
-    missingTgzPackages: [],
+    incompletePackages: [],
     versionMismatchPackages: [],
-    fixedPackages: [],
+    downloadedVersions: [],
     errors: []
   };
   
   try {
-    await checkDirectory(directory, summary, autoFix, spinner);
+    // 第一步：检查文件完整性
+    await checkPackageIntegrity(directory, summary, spinner);
     
-    if (summary.missingTgzPackages.length === 0 && summary.versionMismatchPackages.length === 0) {
-      spinner.succeed('检查结果：所有包都完整且版本正确 \n ');
+    // 如果有不完整的包，生成临时文件
+    if (summary.incompletePackages.length > 0) {
+      await generateIncompletePackagesFile(summary.incompletePackages);
+      spinner.warn(`发现 ${summary.incompletePackages.length} 个依赖存在文件缺失`);
+      console.log(chalk.yellow(`\n⚠️  有 ${summary.incompletePackages.length} 个依赖存在文件缺失，请重新下载这些依赖`));
+      console.log(chalk.blue(`缺失依赖信息已保存到: ${path.join(TEMP_DIR, 'incomplete-packages.json')}`));
+    }
+    
+    // 第二步：检查版本匹配（跳过不完整的包）
+    spinner.text = '正在检查版本匹配...';
+    await checkVersionMatching(directory, summary, spinner);
+    
+    // 版本匹配检查完成提示
+    if (summary.versionMismatchPackages.length > 0) {
+      spinner.succeed(`版本匹配检查完成，发现 ${summary.versionMismatchPackages.length} 个依赖版本不匹配`);
     } else {
-      spinner.warn('检查结果：发现问题包 \n');
+      spinner.succeed('版本匹配检查完成，所有版本都匹配');
+    }
+    
+    // 第三步：下载缺失的版本（如果需要）
+    if (downloadMissingVersions && summary.versionMismatchPackages.length > 0) {
+      console.log(chalk.blue(`\n🔄 正在下载最新版本...`));
+      await downloadMissingVersions_internal(summary);
     }
     
     return summary;
@@ -52,13 +93,309 @@ export async function checkTgzFiles(directory: string, autoFix = false): Promise
 }
 
 /**
- * 检查单个包的tgz文件
- * @param packageName 包名
- * @param directory 包所在目录
- * @param autoFix 是否自动修复
- * @returns 检查结果
+ * 检查包的文件完整性
  */
-export async function checkSinglePackage(packageName: string, directory: string, autoFix = false): Promise<CheckResult> {
+async function checkPackageIntegrity(directory: string, summary: CheckSummary, spinner: any): Promise<void> {
+  const items = await fs.readdir(directory);
+  
+  for (const item of items) {
+    const fullPath = path.join(directory, item);
+    const stat = await fs.lstat(fullPath);
+    
+    if (stat.isDirectory()) {
+      await checkPackageIntegrity(fullPath, summary, spinner);
+    } else if (item === 'package.json') {
+      summary.totalPackages++;
+      spinner.text = `正在检查包完整性 ${summary.totalPackages}...`;
+      
+      const packageDir = path.dirname(fullPath);
+      const packageName = await getPackageNameFromJson(fullPath);
+      
+      if (packageName) {
+        const integrity = await checkSinglePackageIntegrity(packageName, packageDir);
+        if (!integrity.hasPackageJson || !integrity.hasTgzFile) {
+          summary.incompletePackages.push(integrity);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 检查单个包的完整性
+ */
+async function checkSinglePackageIntegrity(packageName: string, packageDir: string): Promise<PackageIntegrity> {
+  const packageJsonPath = path.join(packageDir, 'package.json');
+  const contents = await fs.readdir(packageDir);
+  
+  const hasPackageJson = await fs.pathExists(packageJsonPath);
+  const tgzFiles = contents.filter(file => path.extname(file) === '.tgz');
+  const hasTgzFile = tgzFiles.length > 0;
+  
+  const missingFiles: string[] = [];
+  if (!hasPackageJson) missingFiles.push('package.json');
+  if (!hasTgzFile) missingFiles.push('.tgz文件');
+  
+  return {
+    packageName,
+    packagePath: packageDir,
+    hasPackageJson,
+    hasTgzFile,
+    missingFiles
+  };
+}
+
+/**
+ * 检查版本匹配
+ */
+async function checkVersionMatching(directory: string, summary: CheckSummary, spinner: any): Promise<void> {
+  const items = await fs.readdir(directory);
+  let checkedCount = 0;
+  
+  for (const item of items) {
+    const fullPath = path.join(directory, item);
+    const stat = await fs.lstat(fullPath);
+    
+    if (stat.isDirectory()) {
+      await checkVersionMatching(fullPath, summary, spinner);
+    } else if (item === 'package.json') {
+      const packageDir = path.dirname(fullPath);
+      const packageName = await getPackageNameFromJson(fullPath);
+      
+      if (packageName) {
+        // 跳过不完整的包
+        const isIncomplete = summary.incompletePackages.some(pkg => pkg.packageName === packageName);
+        if (isIncomplete) continue;
+        
+        checkedCount++;
+        spinner.text = `正在检查版本匹配 ${checkedCount}/${summary.totalPackages - summary.incompletePackages.length}...`;
+        
+        const versionInfo = await checkPackageVersionMatch(fullPath, packageDir);
+        if (versionInfo) {
+          summary.versionMismatchPackages.push(versionInfo);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 检查单个包的版本匹配
+ */
+async function checkPackageVersionMatch(packageJsonPath: string, packageDir: string): Promise<VersionMismatchInfo | null> {
+  try {
+    const packageContent = await fs.readJSON(packageJsonPath);
+    const packageName = packageContent.name;
+    
+    if (!packageContent['dist-tags'] || !packageContent['dist-tags']['latest']) {
+      return null;
+    }
+    
+    const expectedVersion = packageContent['dist-tags']['latest'];
+    const contents = await fs.readdir(packageDir);
+    const tgzFiles = contents.filter(file => path.extname(file) === '.tgz');
+    
+    if (tgzFiles.length === 0) {
+      return null;
+    }
+    
+    const hasExpectedVersion = tgzFiles.some(file => file.includes(expectedVersion));
+    
+    if (!hasExpectedVersion) {
+      return {
+        packageName,
+        packagePath: packageDir,
+        currentVersion: getVersionFromFileName(tgzFiles[0]) || 'unknown',
+        expectedVersion
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * 下载缺失的版本
+ */
+async function downloadMissingVersions_internal(summary: CheckSummary): Promise<void> {
+  if (summary.versionMismatchPackages.length === 0) return;
+  
+  // 并发获取下载链接
+  const spinner = ora('正在获取下载链接...');
+  spinner.start();
+  
+  const packagesToDownload: PackageItem[] = [];
+  const totalCount = summary.versionMismatchPackages.length;
+  let completedCount = 0;
+  
+  // 使用 Promise.allSettled 进行并发查询
+  const downloadPromises = summary.versionMismatchPackages.map(async (pkg, index) => {
+    try {
+      const downloadUrl = await getPackageDownloadUrl(pkg.packageName, pkg.expectedVersion);
+      
+      // 更新进度
+      completedCount++;
+      spinner.text = `获取下载链接进度: ${completedCount}/${totalCount} - ${pkg.packageName}`;
+      
+      return {
+        success: true,
+        pkg,
+        downloadUrl,
+        index
+      };
+    } catch (error) {
+      // 更新进度
+      completedCount++;
+      spinner.text = `获取下载链接进度: ${completedCount}/${totalCount} - ${pkg.packageName} (失败)`;
+      
+      return {
+        success: false,
+        pkg,
+        error: error instanceof Error ? error.message : String(error),
+        index
+      };
+    }
+  });
+  
+  const results = await Promise.allSettled(downloadPromises);
+  
+  // 处理结果
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      const { success, pkg, downloadUrl, error } = result.value;
+      
+      if (success && downloadUrl) {
+        packagesToDownload.push({
+          name: pkg.packageName,
+          version: pkg.expectedVersion,
+          resolved: downloadUrl,
+          path: path.relative(path.resolve('./packages'), pkg.packagePath)
+        });
+        pkg.downloadUrl = downloadUrl;
+      } else {
+        summary.errors.push(`获取 ${pkg.packageName}@${pkg.expectedVersion} 下载链接失败: ${error || '未知错误'}`);
+      }
+    } else {
+      // Promise 本身被拒绝的情况
+      summary.errors.push(`获取下载链接时发生错误: ${result.reason}`);
+    }
+  }
+  
+  spinner.succeed(`获取到 ${packagesToDownload.length} 个下载链接`);
+  
+  if (packagesToDownload.length === 0) {
+    console.log(chalk.yellow('没有可下载的包'));
+    return;
+  }
+  
+  // 使用downloader下载
+  const downloader = new PackageDownloader(10);
+  let currentSpinner: any;
+  
+  downloader.setProgressCallback((progress) => {
+    const percentage = ((progress.completed + progress.failed) / progress.total * 100).toFixed(1);
+    const message = [
+      `下载进度: ${progress.completed + progress.failed}/${progress.total} (${percentage}%)`,
+      `成功: ${progress.completed}`,
+      `失败: ${progress.failed}`,
+      progress.current ? `当前: ${progress.current}` : ''
+    ].filter(Boolean).join(' | ');
+    
+    if (currentSpinner) {
+      currentSpinner.text = message;
+    }
+  });
+  
+  currentSpinner = ora('开始下载最新版本依赖...').start();
+  
+  try {
+    const failedPackages = await downloader.downloadPackages(packagesToDownload);
+    currentSpinner.stop();
+    
+    const successCount = packagesToDownload.length - failedPackages.length;
+    summary.downloadedVersions = packagesToDownload
+      .filter(pkg => !failedPackages.some(failed => failed.name === pkg.name))
+      .map(pkg => `${pkg.name}@${pkg.version}`);
+    
+    console.log(chalk.green(`\n✅ 下载完成`));
+    
+    if (failedPackages.length > 0) {
+      console.log(chalk.red(`下载失败: ${failedPackages.length} 个版本`));
+      failedPackages.forEach(pkg => {
+        summary.errors.push(`下载失败: ${pkg.name}@${pkg.version} - ${pkg.error || '未知错误'}`);
+      });
+    }
+  } catch (error) {
+    currentSpinner.fail('下载过程中发生错误');
+    summary.errors.push(`下载失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * 获取包的下载URL
+ */
+async function getPackageDownloadUrl(packageName: string, version: string): Promise<string | null> {
+  try {
+    const registryUrl = `https://registry.npmjs.org/${packageName}/${version}`;
+    const response = await axios.get(registryUrl, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'tgz-box'
+      }
+    });
+    
+    return response.data.dist?.tarball || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * 生成不完整包的信息文件
+ */
+async function generateIncompletePackagesFile(incompletePackages: PackageIntegrity[]): Promise<void> {
+  ensureDirectoryExists(TEMP_DIR);
+  
+  const incompleteInfo = {
+    timestamp: new Date().toISOString(),
+    totalIncomplete: incompletePackages.length,
+    packages: incompletePackages.map(pkg => ({
+      name: pkg.packageName,
+      path: pkg.packagePath,
+      missingFiles: pkg.missingFiles
+    }))
+  };
+  
+  const filePath = path.join(TEMP_DIR, 'incomplete-packages.json');
+  await fs.writeJSON(filePath, incompleteInfo, { spaces: 2 });
+}
+
+/**
+ * 从package.json获取包名
+ */
+async function getPackageNameFromJson(packageJsonPath: string): Promise<string | null> {
+  try {
+    const content = await fs.readJSON(packageJsonPath);
+    return content.name || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 从文件名中提取版本号
+ */
+function getVersionFromFileName(fileName: string): string | null {
+  const match = fileName.match(/-(\d+\.\d+\.\d+.*?)\.tgz$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * 检查单个包的tgz文件（保持向后兼容）
+ */
+export async function checkSinglePackage(packageName: string, directory: string, downloadMissingVersion = false): Promise<CheckResult> {
   const packagePath = path.join(directory, packageName);
   
   if (!await fs.pathExists(packagePath)) {
@@ -68,203 +405,78 @@ export async function checkSinglePackage(packageName: string, directory: string,
     };
   }
   
-  const packageJsonPath = path.join(packagePath, 'package.json');
+  // 检查完整性
+  const integrity = await checkSinglePackageIntegrity(packageName, packagePath);
   
-  if (!await fs.pathExists(packageJsonPath)) {
+  if (!integrity.hasPackageJson || !integrity.hasTgzFile) {
     return {
       code: -1,
-      message: `package.json不存在: ${packageName}`
+      message: `包不完整: ${packageName}，缺失: ${integrity.missingFiles.join(', ')}`
     };
   }
   
-  return await editPackage(packageJsonPath, autoFix);
-}
-
-/**
- * 递归检查目录
- */
-async function checkDirectory(directory: string, summary: CheckSummary, autoFix: boolean, spinner: any): Promise<void> {
-  const items = await fs.readdir(directory);
+  // 检查版本匹配
+  const packageJsonPath = path.join(packagePath, 'package.json');
+  const versionInfo = await checkPackageVersionMatch(packageJsonPath, packagePath);
   
-  for (const item of items) {
-    const fullPath = path.join(directory, item);
-    const stat = await fs.lstat(fullPath);
-    
-    if (stat.isDirectory()) {
-      await checkDirectory(fullPath, summary, autoFix, spinner);
-    } else if (item === 'package.json') {
-      summary.totalPackages++;
-      spinner.text = `正在检查包 ${summary.totalPackages}...`;
+  if (versionInfo) {
+    if (downloadMissingVersion) {
+      // 下载最新版本
+      const summary: CheckSummary = {
+        totalPackages: 1,
+        incompletePackages: [],
+        versionMismatchPackages: [versionInfo],
+        downloadedVersions: [],
+        errors: []
+      };
       
-      const result = await editPackage(fullPath, autoFix);
+      await downloadMissingVersions_internal(summary);
       
-      if (result.message) {
-        switch (result.code) {
-          case -1:
-            if (result.message.includes('No .tgz')) {
-              const packageName = extractPackageName(result.message);
-              summary.missingTgzPackages.push(packageName);
-            } else {
-              summary.errors.push(result.message);
-            }
-            break;
-          case 0:
-            if (result.message.includes('No newest')) {
-              const packageName = extractPackageName(result.message);
-              summary.versionMismatchPackages.push(packageName);
-            }
-            break;
-          case 1:
-            if (result.message.includes('Edit:')) {
-              const packageName = extractPackageName(result.message);
-              summary.fixedPackages.push(packageName);
-            }
-            break;
-        }
-      }
-    }
-  }
-}
-
-/**
- * 编辑包的package.json文件
- */
-async function editPackage(fullPath: string, editPackageJSON: boolean): Promise<CheckResult> {
-  try {
-    const packageContent = await fs.readFile(fullPath, 'utf-8');
-    let parsedContent: any;
-    
-    try {
-      parsedContent = JSON.parse(packageContent);
-    } catch (error) {
-      return {
-        code: -1,
-        message: `Invalid JSON in ${fullPath}`
-      };
-    }
-    
-    const packageName = parsedContent.name;
-    let newest: string;
-    
-    try {
-      newest = parsedContent['dist-tags']['latest'];
-    } catch (e) {
-      return {
-        code: 0,
-        message: `No "dist-tags.latest" in ${packageName}`
-      };
-    }
-    
-    const targetDirectory = path.dirname(fullPath);
-    const contents = await fs.readdir(targetDirectory);
-    
-    // 移除package.json，只保留.tgz文件
-    const tgzFiles = contents.filter(file => 
-      file !== 'package.json' && path.extname(file) === '.tgz'
-    );
-    
-    if (tgzFiles.length === 0) {
-      return {
-        code: -1,
-        message: `No .tgz in ${packageName}`
-      };
-    }
-    
-    const hasNewest = tgzFiles.some(file => file.includes(newest));
-    
-    if (!hasNewest) {
-      if (editPackageJSON) {
-        try {
-          // 获取最新的tgz文件版本
-          const newestTgzVersion = getVersionFromFileName(tgzFiles[tgzFiles.length - 1]);
-          const message = `Edit: ${packageName} ${newest} -> ${newestTgzVersion}`;
-          
-          parsedContent['dist-tags']['latest'] = newestTgzVersion;
-          await fs.writeFile(path.join(targetDirectory, 'package.json'), JSON.stringify(parsedContent, null, 2));
-          
-          return {
-            code: 1,
-            message
-          };
-        } catch (e) {
-          return {
-            code: -1,
-            message: e instanceof Error ? e.message : String(e)
-          };
-        }
+      if (summary.downloadedVersions.length > 0) {
+        return {
+          code: 1,
+          message: `已下载最新版本: ${versionInfo.packageName}@${versionInfo.expectedVersion}`
+        };
       } else {
         return {
           code: 0,
-          message: `No newest(${newest}) .tgz in ${packageName}`
+          message: `版本不匹配但下载失败: ${versionInfo.packageName}`
         };
       }
-    }
-    
-    return {
-      code: 1,
-      message: ''
-    };
-  } catch (error) {
-    return {
-      code: -1,
-      message: `Error processing ${fullPath}: ${error instanceof Error ? error.message : String(error)}`
-    };
-  }
-}
-
-/**
- * 从文件名中提取版本号
- */
-function getVersionFromFileName(fileName: string): string {
-  // 假设文件名格式为: package-name-version.tgz
-  const match = fileName.match(/-([\d\.]+.*?)\.tgz$/);
-  if (match) {
-    return match[1];
-  }
-  throw new Error(`Cannot extract version from filename: ${fileName}`);
-}
-
-/**
- * 从错误消息中提取包名
- */
-function extractPackageName(message: string): string {
-  const patterns = [
-    /No \.tgz in (.+)$/,
-    /No newest\(.+\) \.tgz in (.+)$/,
-    /Edit: (.+?) /,
-    /No "dist-tags\.latest" in (.+)$/
-  ];
-  
-  for (const pattern of patterns) {
-    const match = message.match(pattern);
-    if (match) {
-      return match[1];
+    } else {
+      return {
+        code: 0,
+        message: `版本不匹配: ${versionInfo.packageName} (当前: ${versionInfo.currentVersion}, 期望: ${versionInfo.expectedVersion})`
+      };
     }
   }
   
-  return 'unknown';
+  return {
+    code: 1,
+    message: ''
+  };
 }
 
 /**
  * 打印检查结果摘要
  */
 export function printCheckSummary(summary: CheckSummary): void {
-  console.log(chalk.bold('检查结果摘要:'));
+  console.log(chalk.bold('\n📊 依赖检查摘要:'));
   console.log(chalk.blue(`总包数: ${summary.totalPackages}`));
   
-  if (summary.missingTgzPackages.length > 0) {
-    console.log(chalk.red(`缺少tgz文件的包: ${summary.missingTgzPackages.length}个`));
+  if (summary.incompletePackages.length > 0) {
+    console.log(chalk.red(`文件不完整的包: ${summary.incompletePackages.length}个`));
   }
   
   if (summary.versionMismatchPackages.length > 0) {
     console.log(chalk.yellow(`版本不匹配的包: ${summary.versionMismatchPackages.length}个`));
   }
   
-  if (summary.fixedPackages.length > 0) {
-    console.log(chalk.green(`已修复的包: ${summary.fixedPackages.length}个`));
+  if (summary.downloadedVersions.length > 0) {
+    console.log(chalk.green(`已下载版本: ${summary.downloadedVersions.length}个`));
   }
   
   if (summary.errors.length > 0) {
-    console.log(chalk.red(`错误: ${summary.errors.length}个`));
+    console.log(chalk.red(`处理错误: ${summary.errors.length}个`));
   }
 }

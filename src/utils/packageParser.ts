@@ -97,9 +97,3 @@ function countTotalDependencies(deps: any): number {
   countRecursive(deps);
   return count;
 }
-
-// 保留原有函数
-export function countDependencies(lockData: LockData): number {
-  const packages = parseLockFile(lockData, false);
-  return packages.length;
-}

@@ -17,13 +17,3 @@ export async function clearCache(): Promise<void> {
     throw new Error(`清理缓存失败: ${errorMessage}`);
   }
 }
-
-export async function getCacheInfo(): Promise<string> {
-  try {
-    const { stdout } = await execAsync('npm cache verify');
-    return stdout;
-  } catch (error) {
-    console.error('获取缓存信息失败:', error);
-    return '';
-  }
-}

@@ -3,11 +3,11 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { InstallOptions, PackageItem } from '../types';
 import { checkFilesExistence, readLockFile, cleanupTempDirectory } from '../utils/fileUtils';
-import { parseLockFile, countDependencies } from '../utils/packageParser';
+import { parseLockFile } from '../utils/packageParser';
 import { PackageDownloader } from '../utils/downloader';
 import { clearCache } from '../npm/cache';
 import { generateLockFileFromPackage, generateLockFileFromPackageName } from '../npm/npmUtils';
-import { checkTgzFiles, printCheckSummary } from '../utils/tgzChecker';
+import { checkTgzFiles } from '../utils/tgzChecker';
 import path from 'path';
 import {
   PACKAGE_JSON_PATH,
@@ -222,27 +222,28 @@ async function performAutoCheck() {
   try {
     const packagesDir = path.resolve('./packages');
     
-    // 先进行检查，不打印结果
-    const summary = await checkTgzFiles(packagesDir, false);
+    console.log(chalk.blue('开始检查依赖完整性和版本匹配...'));
     
-    // 如果发现版本不匹配问题，自动修复
-    if (summary.versionMismatchPackages.length > 0) {
-      console.log(chalk.blue('正在自动修复并重新检查依赖版本...'));
-      
-      // 自动修复版本不匹配
-      const fixSummary = await checkTgzFiles(packagesDir, true);
-      
-      // 打印最终检查结果
-      if (fixSummary.fixedPackages.length > 0) {
-        console.log(chalk.green(`已自动修复 ${fixSummary.fixedPackages.length} 个包的版本不匹配问题`));
-      }
+    // 进行完整性和版本检查，自动下载缺失版本
+    const summary = await checkTgzFiles(packagesDir, true);
+    
+    // 打印结果
+    if (summary.incompletePackages.length === 0 && 
+        summary.versionMismatchPackages.length === 0 && 
+        summary.errors.length === 0) {
+      console.log(chalk.green('✅ 所有依赖都完整且版本正确'));
     } else {
-      console.log(chalk.green('所有包都完整且版本正确'));
-    }
-    
-    // 如果还有其他问题（如缺失tgz文件），给出提示
-    if (summary.missingTgzPackages.length > 0) {
-      console.log(chalk.yellow(`提示: 发现 ${summary.missingTgzPackages.length} 个包缺失tgz文件，可能需要重新下载`));
+      if (summary.incompletePackages.length > 0) {
+        console.log(chalk.yellow(`⚠️  发现 ${summary.incompletePackages.length} 个依赖文件不完整`));
+      }
+      
+      if (summary.downloadedVersions.length > 0) {
+        console.log(chalk.green(`✅ 已自动下载 ${summary.downloadedVersions.length} 个最新版本依赖`));
+      }
+      
+      if (summary.errors.length > 0) {
+        console.log(chalk.red(`❌ 处理过程中出现 ${summary.errors.length} 个错误`));
+      }
     }
     
   } catch (error) {

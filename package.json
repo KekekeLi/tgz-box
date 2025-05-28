@@ -1,6 +1,6 @@
 {
   "name": "tgz-box",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "A tool for downloading npm dependencies as tgz files for offline environments",
   "main": "dist/index.js",
   "bin": {

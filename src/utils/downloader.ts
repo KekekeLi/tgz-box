@@ -76,8 +76,9 @@ export class PackageDownloader {
         this.progress.current = `重试 ${retryCount + 1}/${this.maxRetries}: ${pkg.name}`;
         this.updateProgress();
         
-        // 等待一段时间后重试
-        await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+        // 指数退避重试策略
+        const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
         return this.downloadWithRetry(pkg, retryCount + 1);
       } else {
         throw error;
@@ -111,8 +112,10 @@ export class PackageDownloader {
       
       // 获取并保存package.json
       const packageInfoUrl = pkg.resolved.split('/-/')[0];
+      // 根据网络环境调整超时时间
+      const timeout = process.env.NODE_ENV === 'production' ? 20000 : 15000;
       const response = await axios.get(packageInfoUrl, {
-        timeout: 10000,
+        timeout,
         headers: {
           'User-Agent': 'tgz-box'
         }

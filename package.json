@@ -1,6 +1,6 @@
 {
   "name": "tgz-box",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "A tool for downloading npm dependencies as tgz files for offline environments",
   "main": "dist/index.js",
   "bin": {
@@ -24,6 +24,7 @@
   "author": "like",
   "license": "MIT",
   "dependencies": {
+    "@types/semver": "^7.7.0",
     "axios": "^1.6.0",
     "chalk": "^4.1.2",
     "commander": "^12.1.0",
@@ -31,7 +32,8 @@
     "fs-extra": "^11.2.0",
     "inquirer": "^8.2.6",
     "node-cmd": "^5.0.0",
-    "ora": "^5.4.1"
+    "ora": "^5.4.1",
+    "semver": "^7.7.2"
   },
   "devDependencies": {
     "@types/download": "^8.0.5",

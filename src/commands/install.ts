@@ -41,7 +41,7 @@ export async function install(packageName?: string, options: InstallOptions = {}
     await downloadPackages(packages);
 
     // 5. 自动检查
-    console.log('\n' + chalk.blue('开始检查依赖版本...'));
+    console.log('\n' + chalk.blue('开始检查依赖完整性和版本匹配...'));
     await performAutoCheck();
 
   } catch (error) {
@@ -218,35 +218,44 @@ async function handleFailedPackagesRetry(failedPackages: PackageItem[]) {
 }
 
 // 修改performAutoCheck函数
-async function performAutoCheck() {
+async function performAutoCheck(directory?: string) {
   try {
-    const packagesDir = path.resolve('./packages');
-    
-    console.log(chalk.blue('开始检查依赖完整性和版本匹配...'));
+    const packagesDir = directory || path.resolve('./packages');
     
     // 进行完整性和版本检查，自动下载缺失版本
     const summary = await checkTgzFiles(packagesDir, true);
     
-    // 打印结果
-    if (summary.incompletePackages.length === 0 && 
-        summary.versionMismatchPackages.length === 0 && 
-        summary.errors.length === 0) {
-      console.log(chalk.green('✅ 所有依赖都完整且版本正确'));
-    } else {
-      if (summary.incompletePackages.length > 0) {
-        console.log(chalk.yellow(`⚠️  发现 ${summary.incompletePackages.length} 个依赖文件不完整`));
-      }
-      
-      if (summary.downloadedVersions.length > 0) {
-        console.log(chalk.green(`✅ 已自动下载 ${summary.downloadedVersions.length} 个最新版本依赖`));
-      }
-      
-      if (summary.errors.length > 0) {
-        console.log(chalk.red(`❌ 处理过程中出现 ${summary.errors.length} 个错误`));
-      }
+    // 优化提示信息格式
+    console.log('\n' + '='.repeat(50));
+    console.log(chalk.blue('📋 安装结果摘要'));
+    console.log('='.repeat(50));
+    
+    if (summary.incompletePackages.length > 0) {
+      console.log(chalk.yellow(`⚠️  发现 ${summary.incompletePackages.length} 个不完整的包`));
+      console.log(chalk.gray('   已生成详细信息文件供查看'));
     }
+    
+    if (summary.downloadedVersions.length > 0) {
+      console.log(chalk.green(`✅ 已下载 ${summary.downloadedVersions.length} 个major版本依赖`));
+    }
+    
+    if (summary.errors.length > 0) {
+      console.log(chalk.red(`❌ 检查过程中发现 ${summary.errors.length} 个错误`));
+      console.log(chalk.gray('   错误详情:'));
+      summary.errors.forEach(error => console.log(chalk.red(`     - ${error}`)));
+    }
+    
+    if (summary.incompletePackages.length === 0 && 
+        summary.errors.length === 0) {
+      console.log(chalk.green('✅ 所有依赖都完整'));
+    }
+    
+    console.log('='.repeat(50) + '\n');
+    
+    return summary;
     
   } catch (error) {
     console.log(chalk.yellow('自动检查失败，可以手动运行 `tgz-box check` 进行检查'));
+    return { incompletePackages: [], downloadedVersions: [], errors: [] };
   }
 }

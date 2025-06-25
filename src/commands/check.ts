@@ -67,21 +67,21 @@ export async function check(options: CheckOptions = {}): Promise<void> {
       const summary = await checkTgzFiles(targetDirectory, options.fix);
       printCheckSummary(summary);
       
-      // 如果有版本不匹配且未启用自动下载，询问是否要下载
-      if (!options.fix && summary.versionMismatchPackages.length > 0) {
+      // 如果未启用自动下载，询问是否要下载major版本
+      if (!options.fix) {
         const { shouldDownload } = await inquirer.prompt([
           {
             type: 'confirm',
             name: 'shouldDownload',
-            message: `发现 ${summary.versionMismatchPackages.length} 个版本不匹配的依赖，是否要下载最新版本？`,
+            message: '是否要下载每个包的major版本最新版本？',
             default: false
           }
         ]);
         
         if (shouldDownload) {
-          console.log(chalk.blue('\n🔄 开始下载最新版本依赖...'));
-          const downloadSummary = await checkTgzFiles(targetDirectory, true);
-          printCheckSummary(downloadSummary);
+          console.log(chalk.blue('\n开始下载major版本...'));
+          await checkTgzFiles(targetDirectory, true);
+          console.log(chalk.green('✅ 下载完成'));
         }
       }
     }

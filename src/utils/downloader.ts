@@ -5,6 +5,40 @@ import path from 'path';
 import { PackageItem, DownloadProgress } from '../types';
 import { PACKAGES_DIR } from './constants';
 import { ensureDirectoryExists } from './fileUtils';
+import { networkOptimizer } from './networkOptimizer';
+import { failedPackageManager } from './failedPackageManager';
+
+// 信号量类，用于控制并发
+class Semaphore {
+  private permits: number;
+  private waitQueue: Array<() => void> = [];
+
+  constructor(permits: number) {
+    this.permits = permits;
+  }
+
+  async acquire(): Promise<() => void> {
+    return new Promise((resolve) => {
+      if (this.permits > 0) {
+        this.permits--;
+        resolve(() => this.release());
+      } else {
+        this.waitQueue.push(() => {
+          this.permits--;
+          resolve(() => this.release());
+        });
+      }
+    });
+  }
+
+  private release(): void {
+    this.permits++;
+    if (this.waitQueue.length > 0) {
+      const next = this.waitQueue.shift()!;
+      next();
+    }
+  }
+}
 
 export class PackageDownloader {
   private concurrency: number;
@@ -13,13 +47,30 @@ export class PackageDownloader {
   private progress: DownloadProgress;
   private onProgress?: (progress: DownloadProgress) => void;
   private maxRetries: number = 3;
+  private downloadAgent: any;
 
-  constructor(concurrency = 10) {
+  constructor(concurrency = 30) { // 提高默认并发数
     this.concurrency = concurrency;
     this.progress = {
       total: 0,
       completed: 0,
       failed: 0
+    };
+    
+    // 创建优化的下载代理
+    this.downloadAgent = {
+      http: new (require('http').Agent)({
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: concurrency * 2,
+        maxFreeSockets: 10
+      }),
+      https: new (require('https').Agent)({
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: concurrency * 2,
+        maxFreeSockets: 10
+      })
     };
   }
 
@@ -27,43 +78,52 @@ export class PackageDownloader {
     this.onProgress = callback;
   }
 
-  async downloadPackages(packages: PackageItem[]): Promise<PackageItem[]> {
+  async downloadPackages(packages: PackageItem[], skipFailed: boolean = true): Promise<PackageItem[]> {
     ensureDirectoryExists(PACKAGES_DIR);
     
+    // 过滤出需要下载的包（跳过已失败的包）
+    const packagesToDownload = skipFailed 
+      ? packages.filter(pkg => !failedPackageManager.isPackageFailed(pkg))
+      : packages;
+    
+    const skippedCount = packages.length - packagesToDownload.length;
+    
+    if (skippedCount > 0 && skipFailed) {
+      console.log(`跳过 ${skippedCount} 个之前失败的包，将在最后重试`);
+    }
+    
     this.progress = {
-      total: packages.length,
+      total: packagesToDownload.length,
       completed: 0,
       failed: 0
     };
 
     const failedPackages: PackageItem[] = [];
-    const promises: Promise<void>[] = [];
+    const semaphore = new Semaphore(this.concurrency);
 
-    for (const pkg of packages) {
-      const promise = this.downloadWithRetry(pkg)
-        .then(() => {
+    // 使用Promise.allSettled处理所有下载任务
+    const downloadPromises = packagesToDownload.map(async (pkg) => {
+      return semaphore.acquire().then(async (release) => {
+        try {
+          await this.downloadWithRetry(pkg);
           this.progress.completed++;
+          // 如果之前失败过，现在成功了，从失败缓存中移除
+          failedPackageManager.removeSuccessfulPackage(pkg);
           this.updateProgress();
-        })
-        .catch((error) => {
+        } catch (error: any) {
           this.progress.failed++;
-          // 保存失败信息
           const failedPkg = { ...pkg, error: error.message };
           failedPackages.push(failedPkg);
+          // 添加到失败包管理器
+          failedPackageManager.addFailedPackage(pkg, error.message);
           this.updateProgress();
-        });
-      
-      promises.push(promise);
-      
-      if (promises.length >= this.concurrency) {
-        await Promise.allSettled(promises.splice(0, this.concurrency));
-      }
-    }
+        } finally {
+          release();
+        }
+      });
+    });
 
-    if (promises.length > 0) {
-      await Promise.allSettled(promises);
-    }
-
+    await Promise.allSettled(downloadPromises);
     return failedPackages;
   }
 
@@ -94,36 +154,43 @@ export class PackageDownloader {
     ensureDirectoryExists(packageDir);
 
     try {
-      // 下载tgz文件
-      await download(pkg.resolved, packageDir);
-      
-      // 检查是否已存在package.json，如果存在且有效则跳过
+      // 检查是否已存在特定版本的文件
       const packageJsonPath = path.join(packageDir, 'package.json');
-      if (await fs.pathExists(packageJsonPath)) {
+      const expectedTgzName = `${pkg.name}-${pkg.version}.tgz`;
+      const expectedTgzPath = path.join(packageDir, expectedTgzName);
+      
+      if (await fs.pathExists(packageJsonPath) && await fs.pathExists(expectedTgzPath)) {
         try {
           const existingContent = await fs.readJSON(packageJsonPath);
           if (existingContent && existingContent.name) {
-            return; // package.json已存在且有效
+            return; // 特定版本文件已存在且完整
           }
         } catch {
           // 文件损坏，继续重新下载
         }
       }
       
-      // 获取并保存package.json
-      const packageInfoUrl = pkg.resolved.split('/-/')[0];
-      // 根据网络环境调整超时时间
-      const timeout = process.env.NODE_ENV === 'production' ? 20000 : 15000;
-      const response = await axios.get(packageInfoUrl, {
-        timeout,
+      // 使用优化的下载配置
+      const downloadOptions = {
+        agent: this.downloadAgent,
+        timeout: 30000, // 增加超时时间到30秒
+        retries: 3, // 增加重试次数
         headers: {
-          'User-Agent': 'tgz-box'
+          'User-Agent': 'tgz-box-optimized/1.0.0',
+          'Connection': 'keep-alive'
         }
-      });
+      };
+      
+      // 下载tgz文件
+      await download(pkg.resolved, packageDir, downloadOptions);
+      
+      // 获取并保存package.json（使用网络优化器）
+      const packageInfoUrl = pkg.resolved.split('/-/')[0];
+      const packageInfo = await networkOptimizer.getWithRetry(packageInfoUrl);
       
       await fs.writeJSON(
         packageJsonPath,
-        response.data,
+        packageInfo,
         { spaces: 2 }
       );
     } catch (error) {

@@ -4,10 +4,12 @@ import chalk from 'chalk';
 import ora from 'ora';
 import axios from 'axios';
 import semver from 'semver';
+import { execSync } from 'child_process';
 import { PackageDownloader } from './downloader';
 import { PackageItem } from '../types';
 import { TEMP_DIR } from './constants';
 import { ensureDirectoryExists } from './fileUtils';
+import { networkOptimizer } from './networkOptimizer';
 
 interface CheckResult {
   code: number; // -1: error, 0: warning, 1: success
@@ -180,83 +182,73 @@ async function downloadMajorVersionsOptimized(
   const localResults = new Map<string, string[]>();
   const needNetworkFetch: Array<[string, { currentVersion: string, packagePath: string }]> = [];
   
-  // 批量从本地读取版本信息
+  // 首先尝试从本地 package.json 的 versions 字段获取版本信息
   for (const [packageName, info] of packageEntries) {
     try {
-      const localVersions = await getPackageAllVersionsFromLocal(packageName, './packages');
+      const localVersions = await getPackageAllVersionsFromLocal(packageName, path.dirname(info.packagePath));
       if (localVersions && localVersions.length > 0) {
         localResults.set(packageName, localVersions);
-        packageVersionsMap.set(packageName, { 
-          allVersions: localVersions, 
-          currentVersion: info.currentVersion, 
-          packagePath: info.packagePath 
+        packageVersionsMap.set(packageName, {
+          allVersions: localVersions,
+          currentVersion: info.currentVersion,
+          packagePath: info.packagePath
         });
         completedCount++;
+        const percentage = ((completedCount / totalPackages) * 100).toFixed(1);
+        process.stdout.write(`\r   进度: ${completedCount}/${totalPackages} (${percentage}%) - ${packageName} (本地)`);
       } else {
         needNetworkFetch.push([packageName, info]);
       }
     } catch (error) {
+      // 本地获取失败，加入网络获取队列
       needNetworkFetch.push([packageName, info]);
     }
-    
-    // 显示进度
-    const percentage = ((completedCount / totalPackages) * 100).toFixed(1);
-    process.stdout.write(`\r   进度: ${completedCount}/${totalPackages} (${percentage}%) - ${packageName}`);
   }
   
-  // 对于需要网络获取的包，分批处理
+  console.log(`\n✅ 从本地获取到 ${localResults.size} 个包的版本信息`);
   if (needNetworkFetch.length > 0) {
-    const batchSize = 15; // 增加批次大小提高效率
+    console.log(`📡 还需从网络获取 ${needNetworkFetch.length} 个包的版本信息...`);
+  }
+  
+  // 对于需要网络获取的包，使用优化的批量请求
+  if (needNetworkFetch.length > 0) {
     
-    for (let i = 0; i < needNetworkFetch.length; i += batchSize) {
-      const batch = needNetworkFetch.slice(i, i + batchSize);
+    // 构建批量请求URL
+    const registry = getNpmRegistry();
+    const urls = needNetworkFetch.map(([packageName]) => 
+      `${registry.replace(/\/$/, '')}/${packageName}`
+    );
+    
+    // 使用网络优化器进行批量请求
+    const batchResults = await networkOptimizer.batchGet(urls, 15); // 降低并发数提高稳定性
+    
+    // 处理批量结果
+    batchResults.forEach((result, index) => {
+      const [packageName, info] = needNetworkFetch[index];
+      completedCount++;
       
-      const batchPromises = batch.map(async ([packageName, info]) => {
+      const percentage = ((completedCount / totalPackages) * 100).toFixed(1);
+      process.stdout.write(`\r   进度: ${completedCount}/${totalPackages} (${percentage}%) - ${packageName}`);
+      
+      if (result.data && !result.error) {
         try {
-          const allVersions = await getPackageAllVersions(packageName);
-          completedCount++;
+          const versions = Object.keys(result.data.versions || {});
+          const allVersions = versions
+            .filter(version => semver.valid(version))
+            .sort((a, b) => semver.compare(a, b));
           
-          // 显示进度
-          const percentage = ((completedCount / totalPackages) * 100).toFixed(1);
-          process.stdout.write(`\r   进度: ${completedCount}/${totalPackages} (${percentage}%) - ${packageName}`);
-          
-          return {
-            success: true,
-            packageName,
-            allVersions,
-            currentVersion: info.currentVersion,
-            packagePath: info.packagePath
-          } as const;
+          packageVersionsMap.set(packageName, { 
+            allVersions, 
+            currentVersion: info.currentVersion, 
+            packagePath: info.packagePath 
+          });
         } catch (error) {
-          completedCount++;
-          const percentage = ((completedCount / totalPackages) * 100).toFixed(1);
-          process.stdout.write(`\r   进度: ${completedCount}/${totalPackages} (${percentage}%) - ${packageName} (失败)`);
-          
-          return {
-            success: false,
-            packageName,
-            error: error instanceof Error ? error.message : String(error)
-          } as const;
+          summary.errors.push(`解析${packageName}版本信息失败: ${error instanceof Error ? error.message : String(error)}`);
         }
-      });
-      
-      const batchResults = await Promise.allSettled(batchPromises);
-      
-      // 处理批次结果
-      for (const result of batchResults) {
-        if (result.status === 'fulfilled' && result.value.success) {
-          const { packageName, allVersions, currentVersion, packagePath } = result.value;
-          packageVersionsMap.set(packageName, { allVersions, currentVersion, packagePath });
-        } else if (result.status === 'fulfilled' && !result.value.success) {
-          summary.errors.push(`获取${result.value.packageName}版本信息失败: ${result.value.error}`);
-        }
+      } else {
+        summary.errors.push(`获取${packageName}版本信息失败: ${result.error || '未知错误'}`);
       }
-      
-      // 批次间短暂延迟
-      if (i + batchSize < needNetworkFetch.length) {
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-    }
+    });
   }
   
   // 清除进度显示并输出完成信息
@@ -293,6 +285,8 @@ async function downloadMajorVersionsOptimized(
     
     const finalVersions = Array.from(versionsToDownload).sort((a, b) => semver.compare(a, b));
     
+
+    
     finalVersions.forEach(version => {
       packagesToDownload.push({
         name: packageName,
@@ -321,7 +315,7 @@ async function downloadMajorVersionsOptimized(
   // 第三步：批量获取下载链接并下载
   console.log(chalk.blue('📦 开始下载major版本依赖...'));
   
-  const concurrency = 12; // 提高并发数
+  const concurrency = 8; // 降低并发数提高稳定性
   const downloader = new PackageDownloader(concurrency);
   
   // 使用spinner显示下载进度
@@ -348,28 +342,30 @@ async function downloadMajorVersionsOptimized(
   currentSpinner = ora('正在获取下载链接...').start();
   
   try {
-    // 优化：并行获取下载链接，提高效率
-    const urlPromises = packagesToDownload.map(async (pkg) => {
-      try {
-        const downloadUrl = await getPackageDownloadUrl(pkg.name, pkg.version);
-        if (downloadUrl) {
-          return { ...pkg, resolved: downloadUrl };
-        } else {
-          summary.errors.push(`${pkg.name}@${pkg.version}: 获取下载链接失败`);
-          return null;
-        }
-      } catch (error) {
-        summary.errors.push(`${pkg.name}@${pkg.version}: 获取下载链接失败`);
-        return null;
-      }
-    });
+    // 使用网络优化器批量获取下载链接
+    const registry = getNpmRegistry();
+    const versionUrls = packagesToDownload.map(pkg => 
+      `${registry.replace(/\/$/, '')}/${pkg.name}/${pkg.version}`
+    );
     
-    const results = await Promise.allSettled(urlPromises);
+    console.log(chalk.blue(`🔗 批量获取 ${versionUrls.length} 个下载链接...`));
+    
+    // 显示网络自适应状态
+    const networkStatus = networkOptimizer.getNetworkStatus();
+    if (networkStatus.avgTime > 0) {
+      console.log(chalk.gray(`   网络状态: ${networkStatus.speed} | 并发数: ${networkStatus.concurrency} | 平均响应: ${networkStatus.avgTime}ms`));
+    }
+    
+    const linkResults = await networkOptimizer.batchGet(versionUrls, 15); // 降低并发数提高稳定性
+    
     const packagesWithUrls: PackageItem[] = [];
     
-    results.forEach(result => {
-      if (result.status === 'fulfilled' && result.value) {
-        packagesWithUrls.push(result.value);
+    linkResults.forEach((result, index) => {
+      const pkg = packagesToDownload[index];
+      if (result.data && !result.error && result.data.dist?.tarball) {
+        packagesWithUrls.push({ ...pkg, resolved: result.data.dist.tarball });
+      } else {
+        summary.errors.push(`${pkg.name}@${pkg.version}: 获取下载链接失败 - ${result.error || '无tarball信息'}`);
       }
     });
     
@@ -395,9 +391,20 @@ async function downloadMajorVersionsOptimized(
     
     const successCount = packagesWithUrls.length - failedPackages.length;
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    summary.downloadedVersions = packagesWithUrls
-      .filter(pkg => !failedPackages.some(failed => failed.name === pkg.name && failed.version === pkg.version))
-      .map(pkg => `${pkg.name}@${pkg.version}`);
+    const successfulPackages = packagesWithUrls
+      .filter(pkg => !failedPackages.some(failed => failed.name === pkg.name && failed.version === pkg.version));
+    
+    summary.downloadedVersions = successfulPackages.map(pkg => `${pkg.name}@${pkg.version}`);
+    
+    // 移除成功下载包的获取链接失败错误记录
+    successfulPackages.forEach(pkg => {
+      const errorIndex = summary.errors.findIndex(error => 
+        error.includes(`${pkg.name}@${pkg.version}: 获取下载链接失败`)
+      );
+      if (errorIndex !== -1) {
+        summary.errors.splice(errorIndex, 1);
+      }
+    });
     
     console.log(chalk.green.bold(`✅ Major版本下载完成`));
     console.log(chalk.green(`   成功: ${successCount} 个版本`));
@@ -518,7 +525,6 @@ function getLatestVersionsPerMajor(versions: string[], currentVersion?: string):
  */
 function getNpmRegistry(): string {
   try {
-    const { execSync } = require('child_process');
     const registry = execSync('npm config get registry', { encoding: 'utf8' }).trim();
     return registry || 'https://registry.npmjs.org/';
   } catch (error) {

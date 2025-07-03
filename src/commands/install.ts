@@ -8,6 +8,7 @@ import { PackageDownloader } from '../utils/downloader';
 import { clearCache } from '../npm/cache';
 import { generateLockFileFromPackage, generateLockFileFromPackageName } from '../npm/npmUtils';
 import { checkTgzFiles } from '../utils/tgzChecker';
+import { failedPackageManager } from '../utils/failedPackageManager';
 import path from 'path';
 import {
   PACKAGE_JSON_PATH,
@@ -36,9 +37,9 @@ export async function install(packageName?: string, options: InstallOptions = {}
       return;
     }
 
-    // 4. 开始下载
+    // 4. 开始智能下载（跳过失败包，最后重试）
     console.log('\n' + chalk.blue(`开始下载 ${totalCount} 个依赖包...`));
-    await downloadPackages(packages);
+    await downloadPackagesWithRetry(packages);
 
     // 5. 自动检查
     console.log('\n' + chalk.blue('开始检查依赖完整性和版本匹配...'));
@@ -49,7 +50,9 @@ export async function install(packageName?: string, options: InstallOptions = {}
     console.error(chalk.red('操作失败:'), errorMessage);
     process.exit(1);
   } finally {
+    // 清理临时目录和失败包缓存
     cleanupTempDirectory(TEMP_DIR);
+    await failedPackageManager.cleanup();
   }
 }
 
@@ -90,18 +93,85 @@ async function determineLockFile(options: InstallOptions, packageName?: string):
   throw new Error('无法确定要使用的配置文件');
 }
 
-async function downloadPackages(packages: PackageItem[]) {
-  const downloader = new PackageDownloader(10);
+async function downloadPackagesWithRetry(packages: PackageItem[]) {
+  const downloader = new PackageDownloader(30); // 提高并发数，因为会跳过失败包
+  const totalStartTime = Date.now();
+  
+  // 清理之前的失败包缓存（开始新的下载会话）
+  failedPackageManager.clearFailedPackages();
+  failedPackageManager.resetRetryCount();
+  
+  console.log(chalk.blue('📦 采用智能下载策略：先下载稳定包，失败包将在最后重试'));
+  
+  // 第一轮：正常下载（跳过失败包）
+  await performDownloadRound(downloader, packages, '主要下载', true);
+  
+  // 重试失败的包，最多2次
+  while (failedPackageManager.canRetry() && failedPackageManager.getFailedPackages().length > 0) {
+    failedPackageManager.incrementRetryCount();
+    const retryRound = failedPackageManager.getCurrentRetryCount();
+    const failedPackages = failedPackageManager.getFailedPackages();
+    
+    console.log(chalk.yellow(`\n🔄 第 ${retryRound} 次重试，尝试下载 ${failedPackages.length} 个失败的包...`));
+    
+    // 重试时使用更保守的并发数
+    const retryDownloader = new PackageDownloader(10);
+    await performDownloadRound(retryDownloader, failedPackages, `重试 ${retryRound}`, false);
+  }
+  
+  // 最终结果统计
+  const finalStats = failedPackageManager.getStatistics();
+  const totalElapsed = ((Date.now() - totalStartTime) / 1000).toFixed(1);
+  
+  console.log('\n' + '='.repeat(60));
+  console.log(chalk.blue.bold('📊 下载完成统计'));
+  console.log('='.repeat(60));
+  
+  const successCount = packages.length - finalStats.totalFailed;
+  console.log(chalk.green(`✅ 成功下载: ${successCount}/${packages.length} 个包`));
+  
+  if (finalStats.totalFailed > 0) {
+    console.log(chalk.red(`❌ 最终失败: ${finalStats.totalFailed} 个包 (已重试 ${finalStats.retryCount} 次)`));
+    
+    // 显示失败的包
+    const failedPackages = failedPackageManager.getFailedPackages();
+    console.log(chalk.red('\n失败的包列表:'));
+    failedPackages.forEach((pkg, index) => {
+      console.log(chalk.red(`  ${index + 1}. ${pkg.name}@${pkg.version}`));
+      if (pkg.error) {
+        console.log(chalk.gray(`     错误: ${pkg.error}`));
+      }
+    });
+    
+    // 生成失败包的package.json
+    await failedPackageManager.generateFailedPackageJson('./failed-packages.json');
+    console.log(chalk.yellow('\n💡 提示: 可以稍后使用生成的 failed-packages.json 重新尝试下载这些包'));
+  } else {
+    console.log(chalk.green.bold('🎉 所有包下载成功！'));
+  }
+  
+  console.log(chalk.blue(`⏱️  总耗时: ${totalElapsed}s`));
+  console.log(chalk.blue(`📁 文件保存位置: ./packages/`));
+  console.log('='.repeat(60));
+}
+
+// 执行单轮下载的辅助函数
+async function performDownloadRound(
+  downloader: PackageDownloader, 
+  packages: PackageItem[], 
+  roundName: string, 
+  skipFailed: boolean
+): Promise<void> {
   const startTime = Date.now();
   let currentSpinner: any;
 
   // 设置进度回调
   downloader.setProgressCallback((progress) => {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const percentage = ((progress.completed + progress.failed) / progress.total * 100).toFixed(1);
+    const percentage = progress.total > 0 ? ((progress.completed + progress.failed) / progress.total * 100).toFixed(1) : '0.0';
     
     const message = [
-      `下载进度: ${progress.completed + progress.failed}/${progress.total} (${percentage}%)`,
+      `${roundName}: ${progress.completed + progress.failed}/${progress.total} (${percentage}%)`,
       `成功: ${progress.completed}`,
       `失败: ${progress.failed}`,
       `耗时: ${elapsed}s`,
@@ -113,109 +183,22 @@ async function downloadPackages(packages: PackageItem[]) {
     }
   });
 
-  currentSpinner = ora('开始下载...').start();
+  currentSpinner = ora(`开始${roundName}...`).start();
   
   try {
-    const failedPackages = await downloader.downloadPackages(packages);
-    
+    await downloader.downloadPackages(packages, skipFailed);
     currentSpinner.stop();
     
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    
-    if (failedPackages.length === 0) {
-      console.log(chalk.green.bold(`所有依赖下载完成！`));
-      console.log(chalk.green(`总计: ${packages.length} 个包`));
-      console.log(chalk.green(`耗时: ${elapsed}s`));
-    } else {
-      console.log(chalk.yellow.bold(`下载完成，但有 ${failedPackages.length} 个包失败`));
-      console.log(chalk.green(`成功: ${packages.length - failedPackages.length} 个包`));
-      console.log(chalk.red(`失败: ${failedPackages.length} 个包`));
-      console.log(chalk.blue(`耗时: ${elapsed}s`));
-      
-      console.log(chalk.red('失败的包:'));
-      failedPackages.forEach(pkg => {
-        console.log(chalk.red(`  - ${pkg.path}@${pkg.version}${pkg.error ? ` (${pkg.error})` : ''}`));
-      });
-      
-      // 询问用户是否重试失败的包
-      await handleFailedPackagesRetry(failedPackages);
-    }
-    
-    console.log(chalk.blue(`文件保存位置: ./packages/`));
+    console.log(chalk.green(`${roundName}完成，耗时: ${elapsed}s`));
     
   } catch (error) {
-    currentSpinner.fail('下载过程中发生错误');
+    currentSpinner.fail(`${roundName}过程中发生错误`);
     throw error;
   }
 }
 
-// 处理失败包的重试逻辑
-async function handleFailedPackagesRetry(failedPackages: PackageItem[]) {
-  const { shouldRetry } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'shouldRetry',
-      message: `是否重新下载失败的 ${failedPackages.length} 个包？`,
-      default: true
-    }
-  ]);
 
-  if (!shouldRetry) {
-    console.log(chalk.yellow('跳过重试，可以稍后使用相同命令重新下载'));
-    return;
-  }
-
-  // 提供重试选项
-  const { retryOption } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'retryOption',
-      message: '选择重试方式:',
-      choices: [
-        { name: '重试所有失败的包', value: 'all' },
-        { name: '选择特定的包进行重试', value: 'select' },
-        { name: '取消重试', value: 'cancel' }
-      ]
-    }
-  ]);
-
-  if (retryOption === 'cancel') {
-    return;
-  }
-
-  let packagesToRetry = failedPackages;
-
-  if (retryOption === 'select') {
-    const { selectedPackages } = await inquirer.prompt([
-      {
-        type: 'checkbox',
-        name: 'selectedPackages',
-        message: '选择要重试的包:',
-        choices: failedPackages.map(pkg => ({
-          name: `${pkg.path}@${pkg.version}`,
-          value: pkg,
-          checked: true
-        }))
-      }
-    ]);
-    packagesToRetry = selectedPackages;
-  }
-
-  if (packagesToRetry.length === 0) {
-    console.log(chalk.yellow('没有选择要重试的包'));
-    return;
-  }
-
-  console.log(chalk.blue(`\n开始重试下载 ${packagesToRetry.length} 个包...`));
-  
-  // 清除错误信息，重新下载
-  const cleanPackages = packagesToRetry.map(pkg => {
-    const { error, ...cleanPkg } = pkg;
-    return cleanPkg;
-  });
-  
-  await downloadPackages(cleanPackages);
-}
 
 // 修改performAutoCheck函数
 async function performAutoCheck(directory?: string) {

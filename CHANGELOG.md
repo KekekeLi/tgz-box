@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2024-XX-XX
+
+### Added
+- 🚀 智能失败包管理策略
+- 📦 自动生成失败包 package.json
+- 🔄 优化的重试机制
+- ⚡ 提升下载效率和成功率
+
+### Improved
+- 🛡️ 更好的错误隔离和处理
+- 📊 更清晰的下载进度反馈
+- 🎯 更智能的并发控制策略
+
 ## [2.1.0] - 2025-06-09
 
 ### 新增
